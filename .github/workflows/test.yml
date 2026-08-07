@@ -1,226 +1,97 @@
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+name: Video Downloader
 
-    // =========================================
-    // 1. Health check
-    // =========================================
-    if (request.method === "GET" && url.pathname === "/") {
-      return Response.json({
-        ok: true,
-        service: "telegram-reel-bot",
-      });
-    }
+on:
+  workflow_dispatch:
+    inputs:
+      video_url:
+        description: "Paste TikTok / Facebook / Douyin URL"
+        required: true
+        type: string
 
-    // =========================================
-    // 2. Telegram webhook
-    // =========================================
-    if (request.method === "POST" && url.pathname === "/telegram") {
-      try {
-        const update = await request.json();
+  repository_dispatch:
+    types:
+      - telegram-video
 
-        // Không phải message text thì bỏ qua
-        if (!update.message || !update.message.text) {
-          return Response.json({ ok: true });
-        }
+permissions:
+  contents: read
 
-        const chatId = update.message.chat.id;
-        const userId = update.message.from?.id;
-        const text = update.message.text.trim();
+jobs:
+  download:
+    runs-on: ubuntu-latest
 
-        // Chỉ cho Telegram account của bạn sử dụng bot
-        if (
-          String(userId) !== String(env.TELEGRAM_ALLOWED_USER_ID)
-        ) {
-          await sendTelegramMessage(
-            env.TELEGRAM_BOT_TOKEN,
-            chatId,
-            "Bạn không có quyền sử dụng bot này."
-          );
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
 
-          return Response.json({ ok: true });
-        }
+      - name: Resolve video URL
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_URL: ${{ inputs.video_url }}
+          DISPATCH_URL: ${{ github.event.client_payload.video_url }}
+        run: |
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            VIDEO_URL="$DISPATCH_URL"
+          else
+            VIDEO_URL="$MANUAL_URL"
+          fi
 
-        // Tìm URL đầu tiên trong message
-        const urlMatch = text.match(/https?:\/\/[^\s]+/i);
+          if [ -z "$VIDEO_URL" ]; then
+            echo "ERROR: No video URL received"
+            exit 1
+          fi
 
-        if (!urlMatch) {
-          await sendTelegramMessage(
-            env.TELEGRAM_BOT_TOKEN,
-            chatId,
-            "Không tìm thấy link video. Hãy gửi một link TikTok, Facebook hoặc Douyin."
-          );
+          echo "VIDEO_URL=$VIDEO_URL" >> "$GITHUB_ENV"
+          echo "Video URL received successfully"
 
-          return Response.json({ ok: true });
-        }
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          ffmpeg -version | head -n 1
 
-        const videoUrl = cleanUrl(urlMatch[0]);
+      - name: Install yt-dlp
+        run: |
+          python -m pip install -U --pre "yt-dlp[default,curl-cffi]"
+          yt-dlp --version
 
-        await sendTelegramMessage(
-          env.TELEGRAM_BOT_TOKEN,
-          chatId,
-          "Đã nhận link. Đang gửi video sang hệ thống xử lý..."
-        );
+      - name: Download video
+        run: |
+          mkdir -p downloads
 
-        // Gọi GitHub
-        const githubResponse = await dispatchToGitHub(
-          env.GITHUB_TOKEN,
-          videoUrl
-        );
+          yt-dlp \
+            --no-simulate \
+            --no-playlist \
+            --newline \
+            --merge-output-format mp4 \
+            -o "downloads/%(extractor)s-%(id)s.%(ext)s" \
+            "$VIDEO_URL"
 
-        if (!githubResponse.ok) {
-          console.error(
-            "GitHub dispatch error:",
-            githubResponse.status,
-            await githubResponse.text()
-          );
+          echo "Downloaded files:"
+          ls -lah downloads
 
-          await sendTelegramMessage(
-            env.TELEGRAM_BOT_TOKEN,
-            chatId,
-            `Không thể kích hoạt GitHub Actions. HTTP ${githubResponse.status}`
-          );
+      - name: Inspect downloaded video
+        run: |
+          VIDEO_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
 
-          return Response.json({ ok: true });
-        }
+          if [ -z "$VIDEO_FILE" ]; then
+            echo "ERROR: No MP4 file found"
+            find downloads -type f -print
+            exit 1
+          fi
 
-        await sendTelegramMessage(
-          env.TELEGRAM_BOT_TOKEN,
-          chatId,
-          "GitHub Actions đã được kích hoạt. Video đang được tải."
-        );
+          echo "Video file: $VIDEO_FILE"
 
-        return Response.json({ ok: true });
-      } catch (error) {
-        console.error("Telegram webhook error:", error);
+          ffprobe \
+            -v error \
+            -show_entries format=filename,duration,size \
+            -show_entries stream=codec_name,width,height \
+            -of default=noprint_wrappers=1 \
+            "$VIDEO_FILE"
 
-        return Response.json(
-          {
-            ok: false,
-            error: "Internal server error",
-          },
-          { status: 500 }
-        );
-      }
-    }
-
-    // =========================================
-    // 3. Manual dispatch endpoint
-    //    Giữ lại để debug sau này
-    // =========================================
-    if (request.method === "POST" && url.pathname === "/dispatch") {
-      try {
-        const body = await request.json();
-
-        if (!body.video_url) {
-          return Response.json(
-            {
-              ok: false,
-              error: "video_url is required",
-            },
-            { status: 400 }
-          );
-        }
-
-        const githubResponse = await dispatchToGitHub(
-          env.GITHUB_TOKEN,
-          body.video_url
-        );
-
-        if (!githubResponse.ok) {
-          return Response.json(
-            {
-              ok: false,
-              error: "GitHub dispatch failed",
-              status: githubResponse.status,
-            },
-            { status: 502 }
-          );
-        }
-
-        return Response.json({
-          ok: true,
-          message: "Video sent to GitHub Actions",
-        });
-      } catch (error) {
-        console.error(error);
-
-        return Response.json(
-          {
-            ok: false,
-            error: "Internal server error",
-          },
-          { status: 500 }
-        );
-      }
-    }
-
-    return new Response("Not Found", {
-      status: 404,
-    });
-  },
-};
-
-
-// =============================================
-// GitHub repository_dispatch
-// =============================================
-
-async function dispatchToGitHub(githubToken, videoUrl) {
-  return fetch(
-    "https://api.github.com/repos/huutinh-git/telegram-reel-automation/dispatches",
-    {
-      method: "POST",
-
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${githubToken}`,
-        "X-GitHub-Api-Version": "2026-03-10",
-        "User-Agent": "telegram-reel-cloudflare-worker",
-        "Content-Type": "application/json",
-      },
-
-      body: JSON.stringify({
-        event_type: "telegram-video",
-
-        client_payload: {
-          video_url: videoUrl,
-        },
-      }),
-    }
-  );
-}
-
-
-// =============================================
-// Telegram sendMessage
-// =============================================
-
-async function sendTelegramMessage(botToken, chatId, text) {
-  return fetch(
-    `https://api.telegram.org/bot${botToken}/sendMessage`,
-    {
-      method: "POST",
-
-      headers: {
-        "Content-Type": "application/json",
-      },
-
-      body: JSON.stringify({
-        chat_id: chatId,
-        text: text,
-      }),
-    }
-  );
-}
-
-
-// =============================================
-// Clean URL
-// =============================================
-
-function cleanUrl(url) {
-  return url
-    .replace(/[)\]}>.,!?]+$/g, "")
-    .trim();
-}
+      - name: Upload downloaded video
+        uses: actions/upload-artifact@v7
+        with:
+          name: downloaded-video
+          path: downloads/
+          if-no-files-found: error
+          retention-days: 1
