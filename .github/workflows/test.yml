@@ -1,0 +1,25 @@
+name: Test Reel Automation
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Test system
+        run: |
+          echo "=============================="
+          echo "Arthur Reel Automation"
+          echo "GitHub Actions is working"
+          echo "=============================="
+
+      - name: Check Python
+        run: python --version
+
+      - name: Check FFmpeg
+        run: ffmpeg -version | head -n 1
