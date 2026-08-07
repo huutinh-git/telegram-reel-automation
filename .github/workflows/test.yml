@@ -101,26 +101,118 @@ jobs:
           echo "Downloaded files:"
           ls -lah downloads
 
-      - name: Inspect downloaded video
+      - name: Inspect source video
         run: |
-          VIDEO_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
+          SOURCE_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
 
-          if [ -z "$VIDEO_FILE" ]; then
+          if [ -z "$SOURCE_FILE" ]; then
             echo "ERROR: No MP4 file found"
-            echo "Files actually created:"
             find downloads -type f -print
             exit 1
           fi
 
-          echo "Video file: $VIDEO_FILE"
-          echo ""
+          echo "SOURCE_FILE=$SOURCE_FILE" >> "$GITHUB_ENV"
 
+          echo "Source video:"
           ffprobe \
             -v error \
             -show_entries format=filename,duration,size \
-            -show_entries stream=codec_name,width,height \
+            -show_entries stream=codec_name,pix_fmt,width,height \
             -of default=noprint_wrappers=1 \
-            "$VIDEO_FILE"
+            "$SOURCE_FILE"
+
+      - name: Update status - Normalizing
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
+              --data-urlencode "text=🎞️ Đang chuẩn hóa video..." \
+              > /dev/null || true
+          fi
+
+      - name: Normalize video for publishing
+        run: |
+          mkdir -p processed
+
+          VIDEO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$SOURCE_FILE")
+
+          PIX_FMT=$(ffprobe \
+            -v error \
+            -select_streams v:0 \
+            -show_entries stream=pix_fmt \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$SOURCE_FILE")
+
+          AUDIO_CODEC=$(ffprobe \
+            -v error \
+            -select_streams a:0 \
+            -show_entries stream=codec_name \
+            -of default=noprint_wrappers=1:nokey=1 \
+            "$SOURCE_FILE" || true)
+
+          echo "Video codec: $VIDEO_CODEC"
+          echo "Pixel format: $PIX_FMT"
+          echo "Audio codec: $AUDIO_CODEC"
+
+          if [ "$VIDEO_CODEC" = "h264" ] && \
+             [ "$PIX_FMT" = "yuv420p" ] && \
+             { [ "$AUDIO_CODEC" = "aac" ] || [ -z "$AUDIO_CODEC" ]; }; then
+
+            echo "Video already compatible. Remuxing only..."
+
+            ffmpeg \
+              -y \
+              -i "$SOURCE_FILE" \
+              -map 0:v:0 \
+              -map 0:a:0? \
+              -c copy \
+              -movflags +faststart \
+              processed/ready.mp4
+
+          else
+
+            echo "Converting to H.264 + AAC..."
+
+            ffmpeg \
+              -y \
+              -i "$SOURCE_FILE" \
+              -map 0:v:0 \
+              -map 0:a:0? \
+              -c:v libx264 \
+              -preset veryfast \
+              -crf 23 \
+              -pix_fmt yuv420p \
+              -c:a aac \
+              -b:a 128k \
+              -ar 48000 \
+              -movflags +faststart \
+              processed/ready.mp4
+          fi
+
+      - name: Inspect normalized video
+        run: |
+          if [ ! -f "processed/ready.mp4" ]; then
+            echo "ERROR: Normalized video was not created"
+            exit 1
+          fi
+
+          echo "Normalized video:"
+          ffprobe \
+            -v error \
+            -show_entries format=filename,duration,size \
+            -show_entries stream=codec_name,pix_fmt,width,height \
+            -of default=noprint_wrappers=1 \
+            processed/ready.mp4
 
       - name: Update status - Sending
         env:
@@ -132,7 +224,7 @@ jobs:
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=📤 Đã tải xong, đang gửi video..." \
+              --data-urlencode "text=📤 Đã xử lý xong, đang gửi video..." \
               > /dev/null || true
           fi
 
@@ -140,25 +232,18 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
-          VIDEO_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
-
-          if [ -z "$VIDEO_FILE" ]; then
-            echo "ERROR: No MP4 file found"
-            exit 1
-          fi
-
           if [ -z "$CHAT_ID" ]; then
             echo "ERROR: No Telegram chat ID"
             exit 1
           fi
 
-          echo "Sending video to Telegram..."
+          echo "Sending normalized video to Telegram..."
 
           curl --fail-with-body -sS \
             -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo" \
             -F "chat_id=${CHAT_ID}" \
-            -F "video=@${VIDEO_FILE}" \
+            -F "video=@processed/ready.mp4" \
             -F "supports_streaming=true"
 
       - name: Update status - Complete
@@ -175,10 +260,25 @@ jobs:
               > /dev/null || true
           fi
 
-      - name: Upload downloaded video
+      - name: Upload processed video
         uses: actions/upload-artifact@v7
         with:
-          name: downloaded-video
-          path: downloads/
+          name: processed-video
+          path: processed/ready.mp4
           if-no-files-found: error
           retention-days: 1
+
+      - name: Update status - Failed
+        if: ${{ failure() }}
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
+              --data-urlencode "text=❌ Xử lý video thất bại. Kiểm tra GitHub Actions." \
+              > /dev/null || true
+          fi
