@@ -20,9 +20,15 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # =========================================
+      # 1. Checkout
+      # =========================================
       - name: Checkout repository
         uses: actions/checkout@v7
 
+      # =========================================
+      # 2. Resolve request data
+      # =========================================
       - name: Resolve request data
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -53,6 +59,9 @@ jobs:
 
           echo "Request data resolved successfully"
 
+      # =========================================
+      # 3. Install dependencies
+      # =========================================
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
@@ -69,6 +78,9 @@ jobs:
           echo "yt-dlp version:"
           yt-dlp --version
 
+      # =========================================
+      # 4. Telegram status - Downloading
+      # =========================================
       - name: Update status - Downloading
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -83,6 +95,9 @@ jobs:
               > /dev/null || true
           fi
 
+      # =========================================
+      # 5. Download source video
+      # =========================================
       - name: Download video
         run: |
           mkdir -p downloads
@@ -101,12 +116,16 @@ jobs:
           echo "Downloaded files:"
           ls -lah downloads
 
+      # =========================================
+      # 6. Inspect source
+      # =========================================
       - name: Inspect source video
         run: |
           SOURCE_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
 
           if [ -z "$SOURCE_FILE" ]; then
             echo "ERROR: No MP4 file found"
+            echo "Files actually created:"
             find downloads -type f -print
             exit 1
           fi
@@ -114,13 +133,17 @@ jobs:
           echo "SOURCE_FILE=$SOURCE_FILE" >> "$GITHUB_ENV"
 
           echo "Source video:"
+
           ffprobe \
             -v error \
             -show_entries format=filename,duration,size \
-            -show_entries stream=codec_name,pix_fmt,width,height \
+            -show_entries stream=codec_name,pix_fmt,width,height,r_frame_rate \
             -of default=noprint_wrappers=1 \
             "$SOURCE_FILE"
 
+      # =========================================
+      # 7. Telegram status - Normalizing
+      # =========================================
       - name: Update status - Normalizing
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -135,6 +158,9 @@ jobs:
               > /dev/null || true
           fi
 
+      # =========================================
+      # 8. Normalize H.264 + AAC
+      # =========================================
       - name: Normalize video for publishing
         run: |
           mkdir -p processed
@@ -199,6 +225,9 @@ jobs:
               processed/ready.mp4
           fi
 
+      # =========================================
+      # 9. Inspect normalized video
+      # =========================================
       - name: Inspect normalized video
         run: |
           if [ ! -f "processed/ready.mp4" ]; then
@@ -207,14 +236,18 @@ jobs:
           fi
 
           echo "Normalized video:"
+
           ffprobe \
             -v error \
             -show_entries format=filename,duration,size \
-            -show_entries stream=codec_name,pix_fmt,width,height \
+            -show_entries stream=codec_name,pix_fmt,width,height,r_frame_rate \
             -of default=noprint_wrappers=1 \
             processed/ready.mp4
 
-      - name: Update status - Sending
+      # =========================================
+      # 10. Telegram status - Sending
+      # =========================================
+      - name: Update status - Sending to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         run: |
@@ -228,6 +261,9 @@ jobs:
               > /dev/null || true
           fi
 
+      # =========================================
+      # 11. Send processed video to Telegram
+      # =========================================
       - name: Send video to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -246,6 +282,122 @@ jobs:
             -F "video=@processed/ready.mp4" \
             -F "supports_streaming=true"
 
+      # =========================================
+      # 12. Telegram status - Facebook
+      # =========================================
+      - name: Update status - Creating Facebook draft
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
+              --data-urlencode "text=📘 Đang tạo bản nháp Facebook Reel..." \
+              > /dev/null || true
+          fi
+
+      # =========================================
+      # 13. Facebook Reel - CREATE SESSION
+      # =========================================
+      - name: Create Facebook Reel upload session
+        env:
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+        run: |
+          echo "Creating Facebook Reel upload session..."
+
+          START_RESPONSE=$(curl --fail-with-body -sS \
+            -X POST \
+            "https://graph.facebook.com/v26.0/me/video_reels" \
+            --data-urlencode "access_token=${FACEBOOK_PAGE_ACCESS_TOKEN}" \
+            --data-urlencode "upload_phase=start")
+
+          VIDEO_ID=$(echo "$START_RESPONSE" | python -c \
+            "import sys,json; print(json.load(sys.stdin).get('video_id',''))")
+
+          UPLOAD_URL=$(echo "$START_RESPONSE" | python -c \
+            "import sys,json; print(json.load(sys.stdin).get('upload_url',''))")
+
+          if [ -z "$VIDEO_ID" ] || [ -z "$UPLOAD_URL" ]; then
+            echo "ERROR: Facebook did not return video_id or upload_url"
+            echo "$START_RESPONSE"
+            exit 1
+          fi
+
+          echo "FACEBOOK_VIDEO_ID=$VIDEO_ID" >> "$GITHUB_ENV"
+          echo "FACEBOOK_UPLOAD_URL=$UPLOAD_URL" >> "$GITHUB_ENV"
+
+          echo "Facebook upload session created."
+          echo "Video ID: $VIDEO_ID"
+
+      # =========================================
+      # 14. Facebook Reel - UPLOAD FILE
+      # =========================================
+      - name: Upload video to Facebook
+        env:
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+        run: |
+          FILE_SIZE=$(stat -c%s processed/ready.mp4)
+
+          echo "Uploading video to Facebook..."
+          echo "File size: $FILE_SIZE bytes"
+
+          UPLOAD_RESPONSE=$(curl --fail-with-body -sS \
+            -X POST \
+            "$FACEBOOK_UPLOAD_URL" \
+            -H "Authorization: OAuth ${FACEBOOK_PAGE_ACCESS_TOKEN}" \
+            -H "offset: 0" \
+            -H "file_size: ${FILE_SIZE}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary "@processed/ready.mp4")
+
+          echo "$UPLOAD_RESPONSE"
+
+          UPLOAD_SUCCESS=$(echo "$UPLOAD_RESPONSE" | python -c \
+            "import sys,json; print(str(json.load(sys.stdin).get('success',False)).lower())")
+
+          if [ "$UPLOAD_SUCCESS" != "true" ]; then
+            echo "ERROR: Facebook video upload did not return success=true"
+            exit 1
+          fi
+
+          echo "Facebook video upload completed."
+
+      # =========================================
+      # 15. Facebook Reel - FINISH AS DRAFT
+      # =========================================
+      - name: Finish Facebook Reel as DRAFT
+        env:
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+        run: |
+          echo "Finishing Facebook Reel as DRAFT..."
+
+          FINISH_RESPONSE=$(curl --fail-with-body -sS \
+            -X POST \
+            "https://graph.facebook.com/v26.0/me/video_reels" \
+            --data-urlencode "access_token=${FACEBOOK_PAGE_ACCESS_TOKEN}" \
+            --data-urlencode "video_id=${FACEBOOK_VIDEO_ID}" \
+            --data-urlencode "upload_phase=finish" \
+            --data-urlencode "video_state=DRAFT" \
+            --data-urlencode "description=Automation test draft")
+
+          echo "$FINISH_RESPONSE"
+
+          FINISH_SUCCESS=$(echo "$FINISH_RESPONSE" | python -c \
+            "import sys,json; print(str(json.load(sys.stdin).get('success',False)).lower())")
+
+          if [ "$FINISH_SUCCESS" != "true" ]; then
+            echo "ERROR: Facebook did not create the Reel draft successfully"
+            exit 1
+          fi
+
+          echo "Facebook Reel draft created successfully."
+
+      # =========================================
+      # 16. Telegram status - Complete
+      # =========================================
       - name: Update status - Complete
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -256,10 +408,13 @@ jobs:
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=✅ Hoàn tất" \
+              --data-urlencode "text=✅ Hoàn tất — đã tạo Facebook Reel Draft" \
               > /dev/null || true
           fi
 
+      # =========================================
+      # 17. Save processed artifact
+      # =========================================
       - name: Upload processed video
         uses: actions/upload-artifact@v7
         with:
@@ -268,6 +423,9 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # =========================================
+      # 18. Telegram failure status
+      # =========================================
       - name: Update status - Failed
         if: ${{ failure() }}
         env:
@@ -279,6 +437,6 @@ jobs:
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=❌ Xử lý video thất bại. Kiểm tra GitHub Actions." \
+              --data-urlencode "text=❌ Xử lý thất bại. Kiểm tra GitHub Actions." \
               > /dev/null || true
           fi
