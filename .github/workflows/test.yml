@@ -70,7 +70,6 @@ jobs:
           echo "CHAT_ID=$CHAT_ID" >> "$GITHUB_ENV"
           echo "STATUS_MESSAGE_ID=$STATUS_MESSAGE_ID" >> "$GITHUB_ENV"
 
-          # Multiline-safe caption
           CAPTION_DELIMITER=$(python -c "import uuid; print('CAPTION_' + uuid.uuid4().hex)")
 
           {
@@ -82,13 +81,14 @@ jobs:
           echo "Request resolved successfully"
 
       # =====================================================
-      # 3. Install dependencies
+      # 3. Dependencies
       # =====================================================
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
 
+          echo "FFmpeg:"
           ffmpeg -version | head -n 1
 
       - name: Install yt-dlp
@@ -96,10 +96,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -U --pre "yt-dlp[default,curl-cffi]"
 
+          echo "yt-dlp:"
           yt-dlp --version
 
       # =====================================================
-      # 4. Telegram - downloading
+      # 4. Status - downloading
       # =====================================================
       - name: Status - Downloading
         env:
@@ -117,7 +118,7 @@ jobs:
           fi
 
       # =====================================================
-      # 5. Download
+      # 5. Download source
       # =====================================================
       - name: Download source video
         run: |
@@ -135,7 +136,7 @@ jobs:
           ls -lah downloads
 
       # =====================================================
-      # 6. Find source
+      # 6. Inspect source
       # =====================================================
       - name: Inspect source video
         run: |
@@ -174,7 +175,7 @@ jobs:
             "$SOURCE_FILE"
 
       # =====================================================
-      # 7. Telegram - normalize
+      # 7. Status - normalizing
       # =====================================================
       - name: Status - Normalizing
         env:
@@ -192,7 +193,7 @@ jobs:
           fi
 
       # =====================================================
-      # 8. Normalize to Facebook Reel format
+      # 8. Normalize Reel
       # =====================================================
       - name: Normalize video
         run: |
@@ -217,10 +218,13 @@ jobs:
             -movflags +faststart \
             processed/ready.mp4
 
-          test -f processed/ready.mp4
+          if [ ! -f processed/ready.mp4 ]; then
+            echo "ERROR: processed/ready.mp4 not created"
+            exit 1
+          fi
 
       # =====================================================
-      # 9. Verify final video
+      # 9. Verify processed video
       # =====================================================
       - name: Verify processed video
         run: |
@@ -261,7 +265,7 @@ jobs:
           echo "Facebook-ready video verified"
 
       # =====================================================
-      # 10. Telegram - Facebook
+      # 10. Status - Facebook upload
       # =====================================================
       - name: Status - Uploading Facebook
         env:
@@ -279,7 +283,7 @@ jobs:
           fi
 
       # =====================================================
-      # 11. Create Reel upload session
+      # 11. Create Facebook Reel session
       # =====================================================
       - name: Create Facebook Reel session
         env:
@@ -310,7 +314,7 @@ jobs:
           echo "Facebook Video ID: $VIDEO_ID"
 
       # =====================================================
-      # 12. Upload video binary
+      # 12. Upload binary to Facebook
       # =====================================================
       - name: Upload video to Facebook
         env:
@@ -342,7 +346,7 @@ jobs:
           echo "Facebook upload complete"
 
       # =====================================================
-      # 13. Telegram - publishing
+      # 13. Status - publishing
       # =====================================================
       - name: Status - Publishing
         env:
@@ -360,7 +364,7 @@ jobs:
           fi
 
       # =====================================================
-      # 14. PUBLISH PUBLIC REEL + CAPTION
+      # 14. Publish PUBLIC Reel + caption
       # =====================================================
       - name: Publish Facebook Reel
         env:
@@ -400,7 +404,7 @@ jobs:
           echo "Facebook accepted PUBLISHED request"
 
       # =====================================================
-      # 15. Telegram - processing
+      # 15. Status - Facebook processing
       # =====================================================
       - name: Status - Facebook processing
         env:
@@ -413,12 +417,12 @@ jobs:
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=⏳ Facebook đang xử lý Reel..." \
+              --data-urlencode "text=⏳ Facebook đang xử lý và xuất bản Reel..." \
               > /dev/null || true
           fi
 
       # =====================================================
-      # 16. Poll Facebook until published
+      # 16. Wait until publishing completes
       # =====================================================
       - name: Wait for Facebook publishing
         env:
@@ -457,7 +461,7 @@ jobs:
                [ "$PROCESSING_STATUS" = "error" ] || \
                [ "$PUBLISHING_STATUS" = "error" ]; then
 
-              echo "Facebook returned processing error:"
+              echo "Facebook processing error:"
               echo "$STATUS_RESPONSE" | python -m json.tool || true
 
               exit 1
@@ -479,7 +483,7 @@ jobs:
           echo "Facebook publishing confirmed"
 
       # =====================================================
-      # 17. Try to get Reel permalink
+      # 17. Try to get permalink
       # =====================================================
       - name: Get Facebook Reel link
         env:
@@ -495,23 +499,19 @@ jobs:
             || true)
 
           PERMALINK=$(echo "$DETAILS" | python -c \
-            "import sys,json; \
-            d=json.load(sys.stdin); \
-            print(d.get('permalink_url',''))" \
+            "import sys,json; d=json.load(sys.stdin); print(d.get('permalink_url',''))" \
             2>/dev/null || true)
 
-          DELIMITER=$(python -c "import uuid; print('LINK_' + uuid.uuid4().hex)")
+          LINK_DELIMITER=$(python -c "import uuid; print('LINK_' + uuid.uuid4().hex)")
 
           {
-            echo "FACEBOOK_PERMALINK<<$DELIMITER"
+            echo "FACEBOOK_PERMALINK<<$LINK_DELIMITER"
             printf '%s\n' "$PERMALINK"
-            echo "$DELIMITER"
+            echo "$LINK_DELIMITER"
           } >> "$GITHUB_ENV"
 
-          echo "Reel permalink lookup completed"
-
       # =====================================================
-      # 18. FINAL TELEGRAM CONFIRMATION
+      # 18. Telegram final confirmation
       # =====================================================
       - name: Status - Published successfully
         env:
@@ -526,7 +526,7 @@ jobs:
           🔗 ${FACEBOOK_PERMALINK}"
           fi
 
-          # Update old status message
+          # Update existing status message
           if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
             curl -sS \
               -X POST \
@@ -538,7 +538,7 @@ jobs:
               > /dev/null || true
           fi
 
-          # Always send a fresh confirmation as backup
+          # Also send a fresh confirmation
           if [ -n "$CHAT_ID" ]; then
             curl --fail-with-body -sS \
               -X POST \
@@ -568,7 +568,7 @@ jobs:
             -F "supports_streaming=true"
 
       # =====================================================
-      # 20. Debug artifact
+      # 20. Artifact
       # =====================================================
       - name: Upload processed artifact
         uses: actions/upload-artifact@v7
