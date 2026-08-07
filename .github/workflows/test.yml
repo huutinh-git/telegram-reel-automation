@@ -4,8 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "Paste TikTok / Facebook / Douyin URL"
+        description: "Paste source video URL"
         required: true
+        type: string
+
+      caption:
+        description: "Optional Facebook Reel caption"
+        required: false
         type: string
 
   repository_dispatch:
@@ -20,32 +25,38 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # =========================================================
+      # =====================================================
       # 1. Checkout
-      # =========================================================
+      # =====================================================
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      # =========================================================
-      # 2. Resolve Telegram / manual request
-      # =========================================================
+      # =====================================================
+      # 2. Resolve request
+      # =====================================================
       - name: Resolve request data
         env:
           EVENT_NAME: ${{ github.event_name }}
+
           MANUAL_URL: ${{ inputs.video_url }}
+          MANUAL_CAPTION: ${{ inputs.caption }}
 
           DISPATCH_URL: ${{ github.event.client_payload.video_url }}
+          DISPATCH_CAPTION: ${{ github.event.client_payload.caption }}
           DISPATCH_CHAT_ID: ${{ github.event.client_payload.chat_id }}
           DISPATCH_STATUS_MESSAGE_ID: ${{ github.event.client_payload.status_message_id }}
 
           FALLBACK_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
         run: |
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
             VIDEO_URL="$DISPATCH_URL"
+            CAPTION="$DISPATCH_CAPTION"
             CHAT_ID="$DISPATCH_CHAT_ID"
             STATUS_MESSAGE_ID="$DISPATCH_STATUS_MESSAGE_ID"
           else
             VIDEO_URL="$MANUAL_URL"
+            CAPTION="$MANUAL_CAPTION"
             CHAT_ID="$FALLBACK_CHAT_ID"
             STATUS_MESSAGE_ID=""
           fi
@@ -59,17 +70,25 @@ jobs:
           echo "CHAT_ID=$CHAT_ID" >> "$GITHUB_ENV"
           echo "STATUS_MESSAGE_ID=$STATUS_MESSAGE_ID" >> "$GITHUB_ENV"
 
-          echo "Request data resolved successfully"
+          # Multiline-safe caption
+          CAPTION_DELIMITER=$(python -c "import uuid; print('CAPTION_' + uuid.uuid4().hex)")
 
-      # =========================================================
-      # 3. Dependencies
-      # =========================================================
+          {
+            echo "CAPTION<<$CAPTION_DELIMITER"
+            printf '%s\n' "$CAPTION"
+            echo "$CAPTION_DELIMITER"
+          } >> "$GITHUB_ENV"
+
+          echo "Request resolved successfully"
+
+      # =====================================================
+      # 3. Install dependencies
+      # =====================================================
       - name: Install FFmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
 
-          echo "FFmpeg:"
           ffmpeg -version | head -n 1
 
       - name: Install yt-dlp
@@ -77,15 +96,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -U --pre "yt-dlp[default,curl-cffi]"
 
-          echo "yt-dlp:"
           yt-dlp --version
 
-      # =========================================================
-      # 4. Telegram status
-      # =========================================================
+      # =====================================================
+      # 4. Telegram - downloading
+      # =====================================================
       - name: Status - Downloading
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
         run: |
           if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
             curl -sS \
@@ -97,9 +116,9 @@ jobs:
               > /dev/null || true
           fi
 
-      # =========================================================
+      # =====================================================
       # 5. Download
-      # =========================================================
+      # =====================================================
       - name: Download source video
         run: |
           mkdir -p downloads
@@ -112,13 +131,12 @@ jobs:
             -o "downloads/%(extractor)s-%(id)s.%(ext)s" \
             "$VIDEO_URL"
 
-          echo ""
           echo "Downloaded files:"
           ls -lah downloads
 
-      # =========================================================
-      # 6. Find + validate source
-      # =========================================================
+      # =====================================================
+      # 6. Find source
+      # =====================================================
       - name: Inspect source video
         run: |
           SOURCE_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
@@ -137,14 +155,16 @@ jobs:
             -of default=noprint_wrappers=1:nokey=1 \
             "$SOURCE_FILE")
 
-          echo "Source duration: $DURATION seconds"
+          echo "Duration: $DURATION seconds"
 
-          TOO_SHORT=$(python -c "print('yes' if float('$DURATION') < 4 else 'no')")
+          python - <<PY
+          duration = float("$DURATION")
 
-          if [ "$TOO_SHORT" = "yes" ]; then
-            echo "ERROR: Facebook Reel must be at least 4 seconds."
-            exit 1
-          fi
+          if duration < 4:
+              raise SystemExit(
+                  "ERROR: Facebook Reel must be at least 4 seconds"
+              )
+          PY
 
           ffprobe \
             -v error \
@@ -153,12 +173,13 @@ jobs:
             -of default=noprint_wrappers=1 \
             "$SOURCE_FILE"
 
-      # =========================================================
-      # 7. Normalize status
-      # =========================================================
+      # =====================================================
+      # 7. Telegram - normalize
+      # =====================================================
       - name: Status - Normalizing
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
         run: |
           if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
             curl -sS \
@@ -166,23 +187,13 @@ jobs:
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=🎞️ Đang chuẩn hóa video cho Facebook Reel..." \
+              --data-urlencode "text=🎞️ Đang chuẩn hóa video cho Facebook..." \
               > /dev/null || true
           fi
 
-      # =========================================================
-      # 8. Normalize Facebook Reel
-      #
-      # Output:
-      # - MP4
-      # - H.264
-      # - AAC 48 kHz
-      # - 1080 x 1920
-      # - 9:16
-      # - 30 FPS
-      # - yuv420p
-      # - max 60 seconds
-      # =========================================================
+      # =====================================================
+      # 8. Normalize to Facebook Reel format
+      # =====================================================
       - name: Normalize video
         run: |
           mkdir -p processed
@@ -206,25 +217,13 @@ jobs:
             -movflags +faststart \
             processed/ready.mp4
 
-          if [ ! -f "processed/ready.mp4" ]; then
-            echo "ERROR: processed/ready.mp4 was not created"
-            exit 1
-          fi
+          test -f processed/ready.mp4
 
-      # =========================================================
-      # 9. Verify final file
-      # =========================================================
-      - name: Verify Facebook-ready video
+      # =====================================================
+      # 9. Verify final video
+      # =====================================================
+      - name: Verify processed video
         run: |
-          echo "Final video information:"
-
-          ffprobe \
-            -v error \
-            -show_entries format=filename,duration,size \
-            -show_entries stream=codec_name,pix_fmt,width,height,r_frame_rate,sample_rate \
-            -of default=noprint_wrappers=1 \
-            processed/ready.mp4
-
           WIDTH=$(ffprobe \
             -v error \
             -select_streams v:0 \
@@ -246,24 +245,28 @@ jobs:
             -of default=noprint_wrappers=1:nokey=1 \
             processed/ready.mp4)
 
+          echo "Resolution: ${WIDTH}x${HEIGHT}"
+          echo "Codec: $VIDEO_CODEC"
+
           if [ "$WIDTH" != "1080" ] || [ "$HEIGHT" != "1920" ]; then
-            echo "ERROR: Final video is not 1080x1920"
+            echo "ERROR: Invalid final resolution"
             exit 1
           fi
 
           if [ "$VIDEO_CODEC" != "h264" ]; then
-            echo "ERROR: Final video is not H.264"
+            echo "ERROR: Invalid video codec"
             exit 1
           fi
 
-          echo "Facebook video validation passed."
+          echo "Facebook-ready video verified"
 
-      # =========================================================
-      # 10. Facebook status
-      # =========================================================
-      - name: Status - Connecting Facebook
+      # =====================================================
+      # 10. Telegram - Facebook
+      # =====================================================
+      - name: Status - Uploading Facebook
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
         run: |
           if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
             curl -sS \
@@ -271,16 +274,17 @@ jobs:
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=📘 Đang kết nối Facebook và tạo Reel..." \
+              --data-urlencode "text=📘 Đang tải Reel lên Facebook..." \
               > /dev/null || true
           fi
 
-      # =========================================================
-      # 11. Create Facebook Reel upload session
-      # =========================================================
+      # =====================================================
+      # 11. Create Reel upload session
+      # =====================================================
       - name: Create Facebook Reel session
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+
         run: |
           START_RESPONSE=$(curl --fail-with-body -sS \
             -X POST \
@@ -295,7 +299,7 @@ jobs:
             "import sys,json; print(json.load(sys.stdin).get('upload_url',''))")
 
           if [ -z "$VIDEO_ID" ] || [ -z "$UPLOAD_URL" ]; then
-            echo "ERROR: Facebook did not return video_id/upload_url"
+            echo "ERROR: Facebook did not return upload session"
             echo "$START_RESPONSE"
             exit 1
           fi
@@ -303,19 +307,19 @@ jobs:
           echo "FACEBOOK_VIDEO_ID=$VIDEO_ID" >> "$GITHUB_ENV"
           echo "FACEBOOK_UPLOAD_URL=$UPLOAD_URL" >> "$GITHUB_ENV"
 
-          echo "Facebook upload session ready."
           echo "Facebook Video ID: $VIDEO_ID"
 
-      # =========================================================
-      # 12. Upload local video binary
-      # =========================================================
+      # =====================================================
+      # 12. Upload video binary
+      # =====================================================
       - name: Upload video to Facebook
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+
         run: |
           FILE_SIZE=$(stat -c%s processed/ready.mp4)
 
-          echo "Uploading $FILE_SIZE bytes to Facebook..."
+          echo "Uploading $FILE_SIZE bytes..."
 
           UPLOAD_RESPONSE=$(curl --fail-with-body -sS \
             -X POST \
@@ -330,47 +334,20 @@ jobs:
             "import sys,json; print(str(json.load(sys.stdin).get('success',False)).lower())")
 
           if [ "$UPLOAD_SUCCESS" != "true" ]; then
-            echo "ERROR: Facebook upload failed"
+            echo "ERROR: Facebook video upload failed"
             echo "$UPLOAD_RESPONSE"
             exit 1
           fi
 
-          echo "Facebook upload success."
+          echo "Facebook upload complete"
 
-      # =========================================================
-      # 13. Publish Reel - REAL PUBLIC POST
-      # =========================================================
-      - name: Publish Facebook Reel
-        env:
-          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
-        run: |
-          echo "Publishing Reel..."
-
-          PUBLISH_RESPONSE=$(curl --fail-with-body -sS \
-            -X POST \
-            "https://graph.facebook.com/v26.0/me/video_reels" \
-            --data-urlencode "access_token=${FACEBOOK_PAGE_ACCESS_TOKEN}" \
-            --data-urlencode "video_id=${FACEBOOK_VIDEO_ID}" \
-            --data-urlencode "upload_phase=finish" \
-            --data-urlencode "video_state=PUBLISHED")
-
-          PUBLISH_SUCCESS=$(echo "$PUBLISH_RESPONSE" | python -c \
-            "import sys,json; print(str(json.load(sys.stdin).get('success',False)).lower())")
-
-          if [ "$PUBLISH_SUCCESS" != "true" ]; then
-            echo "ERROR: Facebook rejected publish request"
-            echo "$PUBLISH_RESPONSE"
-            exit 1
-          fi
-
-          echo "Facebook accepted PUBLISHED request."
-
-      # =========================================================
-      # 14. Facebook processing status
-      # =========================================================
-      - name: Status - Facebook processing
+      # =====================================================
+      # 13. Telegram - publishing
+      # =====================================================
+      - name: Status - Publishing
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
         run: |
           if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
             curl -sS \
@@ -378,47 +355,101 @@ jobs:
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=⏳ Facebook đã nhận Reel, đang xử lý và xuất bản..." \
+              --data-urlencode "text=🚀 Video đã tải xong. Đang xuất bản Reel..." \
               > /dev/null || true
           fi
 
-      # =========================================================
-      # 15. Poll until Facebook confirms publishing complete
-      # =========================================================
-      - name: Wait until Facebook Reel is published
+      # =====================================================
+      # 14. PUBLISH PUBLIC REEL + CAPTION
+      # =====================================================
+      - name: Publish Facebook Reel
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+
+        run: |
+          CURL_ARGS=(
+            -X POST
+            "https://graph.facebook.com/v26.0/me/video_reels"
+            --data-urlencode "access_token=${FACEBOOK_PAGE_ACCESS_TOKEN}"
+            --data-urlencode "video_id=${FACEBOOK_VIDEO_ID}"
+            --data-urlencode "upload_phase=finish"
+            --data-urlencode "video_state=PUBLISHED"
+          )
+
+          if [ -n "$CAPTION" ]; then
+            CURL_ARGS+=(
+              --data-urlencode "description=${CAPTION}"
+            )
+          fi
+
+          PUBLISH_RESPONSE=$(curl \
+            --fail-with-body \
+            -sS \
+            "${CURL_ARGS[@]}")
+
+          echo "$PUBLISH_RESPONSE"
+
+          PUBLISH_SUCCESS=$(echo "$PUBLISH_RESPONSE" | python -c \
+            "import sys,json; print(str(json.load(sys.stdin).get('success',False)).lower())")
+
+          if [ "$PUBLISH_SUCCESS" != "true" ]; then
+            echo "ERROR: Facebook rejected Reel publish"
+            exit 1
+          fi
+
+          echo "Facebook accepted PUBLISHED request"
+
+      # =====================================================
+      # 15. Telegram - processing
+      # =====================================================
+      - name: Status - Facebook processing
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
+        run: |
+          if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
+              --data-urlencode "text=⏳ Facebook đang xử lý Reel..." \
+              > /dev/null || true
+          fi
+
+      # =====================================================
+      # 16. Poll Facebook until published
+      # =====================================================
+      - name: Wait for Facebook publishing
+        env:
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+
         run: |
           MAX_ATTEMPTS=30
           SLEEP_SECONDS=10
-          PUBLISHED=false
+          FACEBOOK_DONE=false
 
           for ATTEMPT in $(seq 1 $MAX_ATTEMPTS); do
-            echo "Status check $ATTEMPT/$MAX_ATTEMPTS"
+            echo "Facebook status check ${ATTEMPT}/${MAX_ATTEMPTS}"
 
-            STATUS_RESPONSE=$(curl -sS \
-              "https://graph.facebook.com/v26.0/${FACEBOOK_VIDEO_ID}?fields=status&access_token=${FACEBOOK_PAGE_ACCESS_TOKEN}")
-
-            echo "$STATUS_RESPONSE" | python -m json.tool || true
+            STATUS_RESPONSE=$(curl \
+              --fail-with-body \
+              -sS \
+              -G \
+              "https://graph.facebook.com/v26.0/${FACEBOOK_VIDEO_ID}" \
+              --data-urlencode "fields=status" \
+              --data-urlencode "access_token=${FACEBOOK_PAGE_ACCESS_TOKEN}")
 
             VIDEO_STATUS=$(echo "$STATUS_RESPONSE" | python -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('video_status',''))" \
-              2>/dev/null || true)
-
-            UPLOAD_STATUS=$(echo "$STATUS_RESPONSE" | python -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('uploading_phase',{}).get('status',''))" \
-              2>/dev/null || true)
+              "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('video_status',''))")
 
             PROCESSING_STATUS=$(echo "$STATUS_RESPONSE" | python -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('processing_phase',{}).get('status',''))" \
-              2>/dev/null || true)
+              "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('processing_phase',{}).get('status',''))")
 
             PUBLISHING_STATUS=$(echo "$STATUS_RESPONSE" | python -c \
-              "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('publishing_phase',{}).get('status',''))" \
-              2>/dev/null || true)
+              "import sys,json; d=json.load(sys.stdin); print(d.get('status',{}).get('publishing_phase',{}).get('status',''))")
 
             echo "video_status=$VIDEO_STATUS"
-            echo "uploading=$UPLOAD_STATUS"
             echo "processing=$PROCESSING_STATUS"
             echo "publishing=$PUBLISHING_STATUS"
 
@@ -426,71 +457,106 @@ jobs:
                [ "$PROCESSING_STATUS" = "error" ] || \
                [ "$PUBLISHING_STATUS" = "error" ]; then
 
-              echo "ERROR: Facebook Reel processing failed."
-
-              echo "$STATUS_RESPONSE" | python - <<'PY'
-          import sys, json
-
-          try:
-              data = json.load(sys.stdin)
-              status = data.get("status", {})
-
-              for phase_name in ("uploading_phase", "processing_phase", "publishing_phase"):
-                  phase = status.get(phase_name, {})
-                  errors = phase.get("errors", [])
-
-                  if errors:
-                      print(f"{phase_name} errors:")
-                      for error in errors:
-                          print(error)
-
-          except Exception as exc:
-              print("Could not parse Facebook error details:", exc)
-          PY
+              echo "Facebook returned processing error:"
+              echo "$STATUS_RESPONSE" | python -m json.tool || true
 
               exit 1
             fi
 
             if [ "$PUBLISHING_STATUS" = "complete" ]; then
-              echo "Facebook publishing phase is complete."
-              PUBLISHED=true
+              FACEBOOK_DONE=true
               break
             fi
 
-            sleep $SLEEP_SECONDS
+            sleep "$SLEEP_SECONDS"
           done
 
-          if [ "$PUBLISHED" != "true" ]; then
-            echo "ERROR: Timed out waiting for Facebook publishing confirmation."
+          if [ "$FACEBOOK_DONE" != "true" ]; then
+            echo "ERROR: Timed out waiting for Facebook publishing"
             exit 1
           fi
 
-      # =========================================================
-      # 16. Telegram final status
-      # =========================================================
-      - name: Status - Published
+          echo "Facebook publishing confirmed"
+
+      # =====================================================
+      # 17. Try to get Reel permalink
+      # =====================================================
+      - name: Get Facebook Reel link
+        env:
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+
+        run: |
+          DETAILS=$(curl \
+            -sS \
+            -G \
+            "https://graph.facebook.com/v26.0/${FACEBOOK_VIDEO_ID}" \
+            --data-urlencode "fields=permalink_url" \
+            --data-urlencode "access_token=${FACEBOOK_PAGE_ACCESS_TOKEN}" \
+            || true)
+
+          PERMALINK=$(echo "$DETAILS" | python -c \
+            "import sys,json; \
+            d=json.load(sys.stdin); \
+            print(d.get('permalink_url',''))" \
+            2>/dev/null || true)
+
+          DELIMITER=$(python -c "import uuid; print('LINK_' + uuid.uuid4().hex)")
+
+          {
+            echo "FACEBOOK_PERMALINK<<$DELIMITER"
+            printf '%s\n' "$PERMALINK"
+            echo "$DELIMITER"
+          } >> "$GITHUB_ENV"
+
+          echo "Reel permalink lookup completed"
+
+      # =====================================================
+      # 18. FINAL TELEGRAM CONFIRMATION
+      # =====================================================
+      - name: Status - Published successfully
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
         run: |
+          FINAL_TEXT="✅ Reel đã được đăng thành công lên Facebook Page Reels For You."
+
+          if [ -n "$FACEBOOK_PERMALINK" ]; then
+            FINAL_TEXT="${FINAL_TEXT}
+
+          🔗 ${FACEBOOK_PERMALINK}"
+          fi
+
+          # Update old status message
           if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
             curl -sS \
               -X POST \
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=✅ Facebook xác nhận Reel đã được xuất bản." \
+              --data-urlencode "text=${FINAL_TEXT}" \
+              --data-urlencode "disable_web_page_preview=true" \
               > /dev/null || true
           fi
 
-      # =========================================================
-      # 17. Send processed video back to Telegram
-      # =========================================================
-      - name: Send video to Telegram
+          # Always send a fresh confirmation as backup
+          if [ -n "$CHAT_ID" ]; then
+            curl --fail-with-body -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${FINAL_TEXT}" \
+              --data-urlencode "disable_web_page_preview=true"
+          fi
+
+      # =====================================================
+      # 19. Return processed video to Telegram
+      # =====================================================
+      - name: Send processed video to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
         run: |
           if [ -z "$CHAT_ID" ]; then
-            echo "No Telegram chat ID. Skipping Telegram video."
             exit 0
           fi
 
@@ -501,31 +567,45 @@ jobs:
             -F "video=@processed/ready.mp4" \
             -F "supports_streaming=true"
 
-      # =========================================================
-      # 18. Keep artifact for debugging
-      # =========================================================
-      - name: Upload processed video artifact
+      # =====================================================
+      # 20. Debug artifact
+      # =====================================================
+      - name: Upload processed artifact
         uses: actions/upload-artifact@v7
+
         with:
           name: processed-facebook-reel
           path: processed/ready.mp4
           if-no-files-found: error
           retention-days: 1
 
-      # =========================================================
-      # 19. Failure notification
-      # =========================================================
+      # =====================================================
+      # 21. Failure notification
+      # =====================================================
       - name: Status - Failed
         if: ${{ failure() }}
+
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+
         run: |
+          ERROR_TEXT="❌ Không đăng được Reel. Kiểm tra GitHub Actions để xem bước bị lỗi."
+
           if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
             curl -sS \
               -X POST \
               "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
               --data-urlencode "chat_id=${CHAT_ID}" \
               --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
-              --data-urlencode "text=❌ Không đăng được Reel. Mở GitHub Actions để xem bước bị lỗi." \
+              --data-urlencode "text=${ERROR_TEXT}" \
+              > /dev/null || true
+          fi
+
+          if [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "text=${ERROR_TEXT}" \
               > /dev/null || true
           fi
