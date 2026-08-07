@@ -23,16 +23,23 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Resolve video URL
+      - name: Resolve request data
         env:
           EVENT_NAME: ${{ github.event_name }}
           MANUAL_URL: ${{ inputs.video_url }}
           DISPATCH_URL: ${{ github.event.client_payload.video_url }}
+          DISPATCH_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          DISPATCH_STATUS_MESSAGE_ID: ${{ github.event.client_payload.status_message_id }}
+          FALLBACK_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           if [ "$EVENT_NAME" = "repository_dispatch" ]; then
             VIDEO_URL="$DISPATCH_URL"
+            CHAT_ID="$DISPATCH_CHAT_ID"
+            STATUS_MESSAGE_ID="$DISPATCH_STATUS_MESSAGE_ID"
           else
             VIDEO_URL="$MANUAL_URL"
+            CHAT_ID="$FALLBACK_CHAT_ID"
+            STATUS_MESSAGE_ID=""
           fi
 
           if [ -z "$VIDEO_URL" ]; then
@@ -41,7 +48,10 @@ jobs:
           fi
 
           echo "VIDEO_URL=$VIDEO_URL" >> "$GITHUB_ENV"
-          echo "Video URL received successfully"
+          echo "CHAT_ID=$CHAT_ID" >> "$GITHUB_ENV"
+          echo "STATUS_MESSAGE_ID=$STATUS_MESSAGE_ID" >> "$GITHUB_ENV"
+
+          echo "Request data resolved successfully"
 
       - name: Install FFmpeg
         run: |
@@ -58,6 +68,20 @@ jobs:
 
           echo "yt-dlp version:"
           yt-dlp --version
+
+      - name: Update status - Downloading
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
+              --data-urlencode "text=⬇️ Đang tải video..." \
+              > /dev/null || true
+          fi
 
       - name: Download video
         run: |
@@ -98,10 +122,23 @@ jobs:
             -of default=noprint_wrappers=1 \
             "$VIDEO_FILE"
 
+      - name: Update status - Sending
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
+              --data-urlencode "text=📤 Đã tải xong, đang gửi video..." \
+              > /dev/null || true
+          fi
+
       - name: Send video to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           VIDEO_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
 
@@ -110,15 +147,33 @@ jobs:
             exit 1
           fi
 
+          if [ -z "$CHAT_ID" ]; then
+            echo "ERROR: No Telegram chat ID"
+            exit 1
+          fi
+
           echo "Sending video to Telegram..."
 
           curl --fail-with-body -sS \
             -X POST \
             "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendVideo" \
-            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "chat_id=${CHAT_ID}" \
             -F "video=@${VIDEO_FILE}" \
-            -F "supports_streaming=true" \
-            -F "caption=Video downloaded successfully."
+            -F "supports_streaming=true"
+
+      - name: Update status - Complete
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          if [ -n "$STATUS_MESSAGE_ID" ] && [ -n "$CHAT_ID" ]; then
+            curl -sS \
+              -X POST \
+              "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/editMessageText" \
+              --data-urlencode "chat_id=${CHAT_ID}" \
+              --data-urlencode "message_id=${STATUS_MESSAGE_ID}" \
+              --data-urlencode "text=✅ Hoàn tất" \
+              > /dev/null || true
+          fi
 
       - name: Upload downloaded video
         uses: actions/upload-artifact@v7
