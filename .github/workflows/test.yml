@@ -1,6 +1,7 @@
 name: Test Video Downloader
 
 on:
+  # Cho phép chạy thủ công trên GitHub
   workflow_dispatch:
     inputs:
       video_url:
@@ -8,33 +9,90 @@ on:
         required: true
         type: string
 
+  # Cho phép Telegram / Cloudflare / API kích hoạt workflow
+  repository_dispatch:
+    types: [telegram-video]
+
+# GITHUB_TOKEN bên trong workflow chỉ cần quyền đọc repo
+permissions:
+  contents: read
+
 jobs:
   download:
     runs-on: ubuntu-latest
 
     steps:
+      # =========================
+      # 1. Checkout repository
+      # =========================
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
+      # =========================
+      # 2. Check Python
+      # =========================
       - name: Check Python
         run: python --version
 
+      # =========================
+      # 3. Install FFmpeg
+      # =========================
       - name: Install FFmpeg
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
 
-      - name: Install latest yt-dlp nightly
+          echo "FFmpeg version:"
+          ffmpeg -version | head -n 1
+
+      # =========================
+      # 4. Install yt-dlp
+      # =========================
+      - name: Install latest yt-dlp
         run: |
+          python -m pip install --upgrade pip
           python -m pip install -U --pre "yt-dlp[default,curl-cffi]"
+
+          echo "yt-dlp version:"
           yt-dlp --version
 
+          echo ""
           echo "Available impersonation targets:"
-          yt-dlp --list-impersonate-targets
+          yt-dlp --list-impersonate-targets || true
 
+      # =========================
+      # 5. Resolve input URL
+      # =========================
+      - name: Resolve video URL
+        id: resolve_url
+        env:
+          DISPATCH_URL: ${{ github.event.client_payload.video_url }}
+          MANUAL_URL: ${{ inputs.video_url }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
+            VIDEO_URL="$DISPATCH_URL"
+          else
+            VIDEO_URL="$MANUAL_URL"
+          fi
+
+          if [ -z "$VIDEO_URL" ]; then
+            echo "ERROR: No video URL received."
+            exit 1
+          fi
+
+          echo "Video URL received successfully."
+
+          # Lưu URL để các step sau sử dụng.
+          # Không echo URL ra log để hạn chế lộ query parameter không cần thiết.
+          echo "video_url=$VIDEO_URL" >> "$GITHUB_OUTPUT"
+
+      # =========================
+      # 6. Download video
+      # =========================
       - name: Download video
         env:
-          VIDEO_URL: ${{ inputs.video_url }}
+          VIDEO_URL: ${{ steps.resolve_url.outputs.video_url }}
         run: |
           mkdir -p downloads
 
@@ -60,18 +118,23 @@ jobs:
 
           ls -lah downloads
 
+      # =========================
+      # 7. Validate downloaded file
+      # =========================
       - name: Inspect downloaded video
         run: |
           VIDEO_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
 
           if [ -z "$VIDEO_FILE" ]; then
-            echo "No MP4 file found"
+            echo "ERROR: No MP4 file found."
+            echo ""
             echo "Files actually created:"
-            find downloads -type f -maxdepth 2 -print
+            find downloads -maxdepth 2 -type f -print
             exit 1
           fi
 
           echo "Video file: $VIDEO_FILE"
+          echo ""
 
           ffprobe \
             -v error \
@@ -80,8 +143,11 @@ jobs:
             -of default=noprint_wrappers=1 \
             "$VIDEO_FILE"
 
+      # =========================
+      # 8. Upload test artifact
+      # =========================
       - name: Upload downloaded video
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: downloaded-video
           path: downloads/
