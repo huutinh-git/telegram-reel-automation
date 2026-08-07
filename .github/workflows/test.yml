@@ -1,155 +1,226 @@
-name: Test Video Downloader
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
 
-on:
-  # Cho phép chạy thủ công trên GitHub
-  workflow_dispatch:
-    inputs:
-      video_url:
-        description: "Paste TikTok / Facebook / Douyin URL"
-        required: true
-        type: string
+    // =========================================
+    // 1. Health check
+    // =========================================
+    if (request.method === "GET" && url.pathname === "/") {
+      return Response.json({
+        ok: true,
+        service: "telegram-reel-bot",
+      });
+    }
 
-  # Cho phép Telegram / Cloudflare / API kích hoạt workflow
-  repository_dispatch:
-    types: [telegram-video]
+    // =========================================
+    // 2. Telegram webhook
+    // =========================================
+    if (request.method === "POST" && url.pathname === "/telegram") {
+      try {
+        const update = await request.json();
 
-# GITHUB_TOKEN bên trong workflow chỉ cần quyền đọc repo
-permissions:
-  contents: read
+        // Không phải message text thì bỏ qua
+        if (!update.message || !update.message.text) {
+          return Response.json({ ok: true });
+        }
 
-jobs:
-  download:
-    runs-on: ubuntu-latest
+        const chatId = update.message.chat.id;
+        const userId = update.message.from?.id;
+        const text = update.message.text.trim();
 
-    steps:
-      # =========================
-      # 1. Checkout repository
-      # =========================
-      - name: Checkout repository
-        uses: actions/checkout@v7
+        // Chỉ cho Telegram account của bạn sử dụng bot
+        if (
+          String(userId) !== String(env.TELEGRAM_ALLOWED_USER_ID)
+        ) {
+          await sendTelegramMessage(
+            env.TELEGRAM_BOT_TOKEN,
+            chatId,
+            "Bạn không có quyền sử dụng bot này."
+          );
 
-      # =========================
-      # 2. Check Python
-      # =========================
-      - name: Check Python
-        run: python --version
+          return Response.json({ ok: true });
+        }
 
-      # =========================
-      # 3. Install FFmpeg
-      # =========================
-      - name: Install FFmpeg
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+        // Tìm URL đầu tiên trong message
+        const urlMatch = text.match(/https?:\/\/[^\s]+/i);
 
-          echo "FFmpeg version:"
-          ffmpeg -version | head -n 1
+        if (!urlMatch) {
+          await sendTelegramMessage(
+            env.TELEGRAM_BOT_TOKEN,
+            chatId,
+            "Không tìm thấy link video. Hãy gửi một link TikTok, Facebook hoặc Douyin."
+          );
 
-      # =========================
-      # 4. Install yt-dlp
-      # =========================
-      - name: Install latest yt-dlp
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -U --pre "yt-dlp[default,curl-cffi]"
+          return Response.json({ ok: true });
+        }
 
-          echo "yt-dlp version:"
-          yt-dlp --version
+        const videoUrl = cleanUrl(urlMatch[0]);
 
-          echo ""
-          echo "Available impersonation targets:"
-          yt-dlp --list-impersonate-targets || true
+        await sendTelegramMessage(
+          env.TELEGRAM_BOT_TOKEN,
+          chatId,
+          "Đã nhận link. Đang gửi video sang hệ thống xử lý..."
+        );
 
-      # =========================
-      # 5. Resolve input URL
-      # =========================
-      - name: Resolve video URL
-        id: resolve_url
-        env:
-          DISPATCH_URL: ${{ github.event.client_payload.video_url }}
-          MANUAL_URL: ${{ inputs.video_url }}
-          EVENT_NAME: ${{ github.event_name }}
-        run: |
-          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            VIDEO_URL="$DISPATCH_URL"
-          else
-            VIDEO_URL="$MANUAL_URL"
-          fi
+        // Gọi GitHub
+        const githubResponse = await dispatchToGitHub(
+          env.GITHUB_TOKEN,
+          videoUrl
+        );
 
-          if [ -z "$VIDEO_URL" ]; then
-            echo "ERROR: No video URL received."
-            exit 1
-          fi
+        if (!githubResponse.ok) {
+          console.error(
+            "GitHub dispatch error:",
+            githubResponse.status,
+            await githubResponse.text()
+          );
 
-          echo "Video URL received successfully."
+          await sendTelegramMessage(
+            env.TELEGRAM_BOT_TOKEN,
+            chatId,
+            `Không thể kích hoạt GitHub Actions. HTTP ${githubResponse.status}`
+          );
 
-          # Lưu URL để các step sau sử dụng.
-          # Không echo URL ra log để hạn chế lộ query parameter không cần thiết.
-          echo "video_url=$VIDEO_URL" >> "$GITHUB_OUTPUT"
+          return Response.json({ ok: true });
+        }
 
-      # =========================
-      # 6. Download video
-      # =========================
-      - name: Download video
-        env:
-          VIDEO_URL: ${{ steps.resolve_url.outputs.video_url }}
-        run: |
-          mkdir -p downloads
+        await sendTelegramMessage(
+          env.TELEGRAM_BOT_TOKEN,
+          chatId,
+          "GitHub Actions đã được kích hoạt. Video đang được tải."
+        );
 
-          echo "================================"
-          echo "Starting video download"
-          echo "================================"
+        return Response.json({ ok: true });
+      } catch (error) {
+        console.error("Telegram webhook error:", error);
 
-          yt-dlp \
-            --no-simulate \
-            --no-playlist \
-            --newline \
-            --merge-output-format mp4 \
-            --print "Extractor: %(extractor)s" \
-            --print "Video ID: %(id)s" \
-            --print "Title: %(title)s" \
-            -o "downloads/%(extractor)s-%(id)s.%(ext)s" \
-            "$VIDEO_URL"
+        return Response.json(
+          {
+            ok: false,
+            error: "Internal server error",
+          },
+          { status: 500 }
+        );
+      }
+    }
 
-          echo ""
-          echo "================================"
-          echo "Downloaded files"
-          echo "================================"
+    // =========================================
+    // 3. Manual dispatch endpoint
+    //    Giữ lại để debug sau này
+    // =========================================
+    if (request.method === "POST" && url.pathname === "/dispatch") {
+      try {
+        const body = await request.json();
 
-          ls -lah downloads
+        if (!body.video_url) {
+          return Response.json(
+            {
+              ok: false,
+              error: "video_url is required",
+            },
+            { status: 400 }
+          );
+        }
 
-      # =========================
-      # 7. Validate downloaded file
-      # =========================
-      - name: Inspect downloaded video
-        run: |
-          VIDEO_FILE=$(find downloads -type f -name "*.mp4" | head -n 1)
+        const githubResponse = await dispatchToGitHub(
+          env.GITHUB_TOKEN,
+          body.video_url
+        );
 
-          if [ -z "$VIDEO_FILE" ]; then
-            echo "ERROR: No MP4 file found."
-            echo ""
-            echo "Files actually created:"
-            find downloads -maxdepth 2 -type f -print
-            exit 1
-          fi
+        if (!githubResponse.ok) {
+          return Response.json(
+            {
+              ok: false,
+              error: "GitHub dispatch failed",
+              status: githubResponse.status,
+            },
+            { status: 502 }
+          );
+        }
 
-          echo "Video file: $VIDEO_FILE"
-          echo ""
+        return Response.json({
+          ok: true,
+          message: "Video sent to GitHub Actions",
+        });
+      } catch (error) {
+        console.error(error);
 
-          ffprobe \
-            -v error \
-            -show_entries format=filename,duration,size \
-            -show_entries stream=codec_name,width,height \
-            -of default=noprint_wrappers=1 \
-            "$VIDEO_FILE"
+        return Response.json(
+          {
+            ok: false,
+            error: "Internal server error",
+          },
+          { status: 500 }
+        );
+      }
+    }
 
-      # =========================
-      # 8. Upload test artifact
-      # =========================
-      - name: Upload downloaded video
-        uses: actions/upload-artifact@v7
-        with:
-          name: downloaded-video
-          path: downloads/
-          if-no-files-found: error
-          retention-days: 1
+    return new Response("Not Found", {
+      status: 404,
+    });
+  },
+};
+
+
+// =============================================
+// GitHub repository_dispatch
+// =============================================
+
+async function dispatchToGitHub(githubToken, videoUrl) {
+  return fetch(
+    "https://api.github.com/repos/huutinh-git/telegram-reel-automation/dispatches",
+    {
+      method: "POST",
+
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${githubToken}`,
+        "X-GitHub-Api-Version": "2026-03-10",
+        "User-Agent": "telegram-reel-cloudflare-worker",
+        "Content-Type": "application/json",
+      },
+
+      body: JSON.stringify({
+        event_type: "telegram-video",
+
+        client_payload: {
+          video_url: videoUrl,
+        },
+      }),
+    }
+  );
+}
+
+
+// =============================================
+// Telegram sendMessage
+// =============================================
+
+async function sendTelegramMessage(botToken, chatId, text) {
+  return fetch(
+    `https://api.telegram.org/bot${botToken}/sendMessage`,
+    {
+      method: "POST",
+
+      headers: {
+        "Content-Type": "application/json",
+      },
+
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+      }),
+    }
+  );
+}
+
+
+// =============================================
+// Clean URL
+// =============================================
+
+function cleanUrl(url) {
+  return url
+    .replace(/[)\]}>.,!?]+$/g, "")
+    .trim();
+}
