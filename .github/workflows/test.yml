@@ -8,6 +8,12 @@ on:
         required: true
         type: string
 
+      dry_run:
+        description: "Process locally and create an artifact; DO NOT publish to Facebook"
+        required: false
+        type: boolean
+        default: false
+
       caption:
         description: "Optional Facebook Reel caption"
         required: false
@@ -30,55 +36,26 @@ jobs:
       # =====================================================
       - name: Checkout repository
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       # =====================================================
       # 2. Resolve request
       # =====================================================
       - name: Resolve request data
+        id: request
         env:
           EVENT_NAME: ${{ github.event_name }}
-
           MANUAL_URL: ${{ inputs.video_url }}
           MANUAL_CAPTION: ${{ inputs.caption }}
-
+          MANUAL_DRY_RUN: ${{ inputs.dry_run }}
           DISPATCH_URL: ${{ github.event.client_payload.video_url }}
           DISPATCH_CAPTION: ${{ github.event.client_payload.caption }}
           DISPATCH_CHAT_ID: ${{ github.event.client_payload.chat_id }}
           DISPATCH_STATUS_MESSAGE_ID: ${{ github.event.client_payload.status_message_id }}
-
           FALLBACK_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-        run: |
-          if [ "$EVENT_NAME" = "repository_dispatch" ]; then
-            VIDEO_URL="$DISPATCH_URL"
-            CAPTION="$DISPATCH_CAPTION"
-            CHAT_ID="$DISPATCH_CHAT_ID"
-            STATUS_MESSAGE_ID="$DISPATCH_STATUS_MESSAGE_ID"
-          else
-            VIDEO_URL="$MANUAL_URL"
-            CAPTION="$MANUAL_CAPTION"
-            CHAT_ID="$FALLBACK_CHAT_ID"
-            STATUS_MESSAGE_ID=""
-          fi
-
-          if [ -z "$VIDEO_URL" ]; then
-            echo "ERROR: No video URL received"
-            exit 1
-          fi
-
-          echo "VIDEO_URL=$VIDEO_URL" >> "$GITHUB_ENV"
-          echo "CHAT_ID=$CHAT_ID" >> "$GITHUB_ENV"
-          echo "STATUS_MESSAGE_ID=$STATUS_MESSAGE_ID" >> "$GITHUB_ENV"
-
-          CAPTION_DELIMITER=$(python -c "import uuid; print('CAPTION_' + uuid.uuid4().hex)")
-
-          {
-            echo "CAPTION<<$CAPTION_DELIMITER"
-            printf '%s\n' "$CAPTION"
-            echo "$CAPTION_DELIMITER"
-          } >> "$GITHUB_ENV"
-
-          echo "Request resolved successfully"
+          ALLOWED_SOURCE_HOSTS: ${{ vars.ALLOWED_SOURCE_HOSTS }}
+        run: python3 scripts/prepare_request.py
 
       # =====================================================
       # 3. Dependencies
@@ -94,7 +71,7 @@ jobs:
       - name: Install yt-dlp
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -U --pre "yt-dlp[default,curl-cffi]"
+          python -m pip install "yt-dlp[default,curl-cffi]==2026.10.26"
 
           echo "yt-dlp:"
           yt-dlp --version
@@ -103,6 +80,8 @@ jobs:
       # 4. Status - downloading
       # =====================================================
       - name: Status - Downloading
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
@@ -178,6 +157,8 @@ jobs:
       # 7. Status - normalizing
       # =====================================================
       - name: Status - Normalizing
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
@@ -264,10 +245,17 @@ jobs:
 
           echo "Facebook-ready video verified"
 
+      - name: Dry-run summary (no Facebook or Telegram requests)
+        if: ${{ steps.request.outputs.dry_run == 'true' }}
+        run: |
+          echo "Video validated and transcoded. All Facebook and Telegram API steps were skipped." >> "$GITHUB_STEP_SUMMARY"
+
       # =====================================================
       # 10. Status - Facebook upload
       # =====================================================
       - name: Status - Uploading Facebook
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
@@ -286,6 +274,7 @@ jobs:
       # 11. Create Facebook Reel session
       # =====================================================
       - name: Create Facebook Reel session
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
 
@@ -304,10 +293,11 @@ jobs:
 
           if [ -z "$VIDEO_ID" ] || [ -z "$UPLOAD_URL" ]; then
             echo "ERROR: Facebook did not return upload session"
-            echo "$START_RESPONSE"
+            echo "Facebook did not provide a usable upload session (details withheld)"
             exit 1
           fi
 
+          echo "::add-mask::$UPLOAD_URL"
           echo "FACEBOOK_VIDEO_ID=$VIDEO_ID" >> "$GITHUB_ENV"
           echo "FACEBOOK_UPLOAD_URL=$UPLOAD_URL" >> "$GITHUB_ENV"
 
@@ -317,6 +307,7 @@ jobs:
       # 12. Upload binary to Facebook
       # =====================================================
       - name: Upload video to Facebook
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
 
@@ -339,7 +330,7 @@ jobs:
 
           if [ "$UPLOAD_SUCCESS" != "true" ]; then
             echo "ERROR: Facebook video upload failed"
-            echo "$UPLOAD_RESPONSE"
+            echo "Facebook rejected the upload (response withheld)"
             exit 1
           fi
 
@@ -349,6 +340,8 @@ jobs:
       # 13. Status - publishing
       # =====================================================
       - name: Status - Publishing
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
@@ -367,6 +360,7 @@ jobs:
       # 14. Publish PUBLIC Reel + caption
       # =====================================================
       - name: Publish Facebook Reel
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
 
@@ -391,7 +385,7 @@ jobs:
             -sS \
             "${CURL_ARGS[@]}")
 
-          echo "$PUBLISH_RESPONSE"
+          echo "Facebook publish request completed; checking status"
 
           PUBLISH_SUCCESS=$(echo "$PUBLISH_RESPONSE" | python -c \
             "import sys,json; print(str(json.load(sys.stdin).get('success',False)).lower())")
@@ -407,6 +401,8 @@ jobs:
       # 15. Status - Facebook processing
       # =====================================================
       - name: Status - Facebook processing
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
@@ -425,6 +421,7 @@ jobs:
       # 16. Wait until publishing completes
       # =====================================================
       - name: Wait for Facebook publishing
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
 
@@ -486,6 +483,7 @@ jobs:
       # 17. Try to get permalink
       # =====================================================
       - name: Get Facebook Reel link
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
         env:
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
 
@@ -514,6 +512,8 @@ jobs:
       # 18. Telegram final confirmation
       # =====================================================
       - name: Status - Published successfully
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
@@ -552,6 +552,8 @@ jobs:
       # 19. Return processed video to Telegram
       # =====================================================
       - name: Send processed video to Telegram
+        if: ${{ steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
 
@@ -571,6 +573,7 @@ jobs:
       # 20. Artifact
       # =====================================================
       - name: Upload processed artifact
+        continue-on-error: true
         uses: actions/upload-artifact@v7
 
         with:
@@ -583,7 +586,8 @@ jobs:
       # 21. Failure notification
       # =====================================================
       - name: Status - Failed
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.request.outputs.dry_run != 'true' }}
+        continue-on-error: true
 
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
