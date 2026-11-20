@@ -1,0 +1,28 @@
+# Local credentials: do not commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+credentials*.json
+
+# Downloaded / processed media
+/downloads/
+/processed/
+*.mp4
+*.mov
+*.mkv
+*.webm
+
+# Temporary and OS/editor files
+*.log
+*.tmp
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
